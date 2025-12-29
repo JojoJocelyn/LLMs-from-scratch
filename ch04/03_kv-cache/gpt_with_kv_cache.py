@@ -33,13 +33,22 @@ class MultiHeadAttention(nn.Module):
 
         ####################################################
         # NEW
-        self.register_buffer("cache_k", None, persistent=False)
+        self.register_buffer("cache_k", None, persistent=False) # Liwen: persistent=False means don't save cache when saving model weights
         self.register_buffer("cache_v", None, persistent=False)
-        self.ptr_current_pos = 0
+        self.ptr_current_pos = 0 #Liwen: Tracks position in the sequence (for correct masking)
         ####################################################
 
     def forward(self, x, use_cache=False):
         b, num_tokens, d_in = x.shape
+        """
+        x.shape = (b, num_tokens, d_in)
+           │      │         │
+           │      │         └── d_in: embedding dimension (size of each token's vector)
+           │      │
+           │      └── num_tokens: sequence length (how many tokens)
+           │
+           └── b: batch size (how many sequences processed together)
+        """
 
         keys_new = self.W_key(x)  # Shape: (b, num_tokens, d_out)
         values_new = self.W_value(x)
@@ -72,19 +81,86 @@ class MultiHeadAttention(nn.Module):
         # Compute scaled dot-product attention (aka self-attention) with a causal mask
         attn_scores = queries @ keys.transpose(2, 3)  # Dot product for each head
 
-        ####################################################
+        #################################################### TODO: explain this part
         # NEW
-        num_tokens_Q = queries.shape[-2]
+        num_tokens_Q = queries.shape[-2] #queries became (b, self.num_heads, num_tokens, self.head_dim) after above .view reshape
         num_tokens_K = keys.shape[-2]
         if use_cache:
             mask_bool = self.mask.bool()[
                 self.ptr_current_pos:self.ptr_current_pos + num_tokens_Q, :num_tokens_K
             ]
             self.ptr_current_pos += num_tokens_Q
+            """
+            **Why is this needed?**
+
+            The causal mask prevents attending to future tokens. When using cache:
+            - Queries are only for the **new** token(s)
+            - Keys include **all** tokens (cached + new)
+
+            **Example:** Generating the 3rd token (positions 0, 1 already cached):
+            ```
+            Full causal mask:          What we need (row 2 only):
+                K₀  K₁  K₂                 K₀  K₁  K₂
+            Q₀ [ 0   1   1 ]           Q₂ [ 0   0   0 ]  ← can attend to all previous
+            Q₁ [ 0   0   1 ]
+            Q₂ [ 0   0   0 ]  ←
+
+            self.ptr_current_pos = 2
+            mask_bool = self.mask[2:3, :3]  # Gets just the row we need
+            """
         ####################################################
         # Original mask truncated to the number of tokens and converted to boolean
         else:
             mask_bool = self.mask.bool()[:num_tokens_Q, :num_tokens_K]
+            """
+            ## Visual Explanation
+
+            Let's say we have 4 tokens: `["I", "love", "deep", "learning"]`
+
+            ### Attention Score Matrix (Q @ Kᵀ)
+            ```
+                            Keys (what we attend TO)
+                            K₀     K₁      K₂      K₃
+                        "I"   "love"  "deep" "learning"
+                        ┌─────┬───────┬───────┬──────────┐
+            Q₀ "I"      │ 0.8 │  0.3  │  0.2  │   0.1    │  ← Query 0 attends to Keys 0,1,2,3
+                        ├─────┼───────┼───────┼──────────┤
+            Q₁ "love"   │ 0.4 │  0.9  │  0.3  │   0.2    │  ← Query 1 attends to Keys 0,1,2,3
+            Queries     ├─────┼───────┼───────┼──────────┤
+            (who is     Q₂ "deep"   │ 0.2 │  0.5  │  0.7  │   0.4    │
+            asking)     ├─────┼───────┼───────┼──────────┤
+                        Q₃ "learning"│ 0.1 │  0.3  │  0.4  │   0.8    │
+                        └─────┴───────┴───────┴──────────┘
+            ```
+
+            ### Causal Mask (upper triangular = 1 means "block")
+            ```
+                        K₀    K₁    K₂    K₃
+                        ┌─────┬─────┬─────┬─────┐
+            Q₀          │  0  │  1  │  1  │  1  │  "I" can only see "I"
+                        ├─────┼─────┼─────┼─────┤
+            Q₁          │  0  │  0  │  1  │  1  │  "love" can see "I", "love"
+                        ├─────┼─────┼─────┼─────┤
+            Q₂          │  0  │  0  │  0  │  1  │  "deep" can see "I", "love", "deep"
+                        ├─────┼─────┼─────┼─────┤
+            Q₃          │  0  │  0  │  0  │  0  │  "learning" can see all
+                        └─────┴─────┴─────┴─────┘
+                        
+                        0 = can attend, 1 = blocked (will become -inf)
+
+            ## The General Rule
+
+            | Dimension | Represents | Why |
+            |-----------|-----------|-----|
+            | Rows (`:num_tokens_Q`) | Query positions | Each row = which keys can this query attend to |
+            | Columns (`:num_tokens_K`) | Key positions | Each column = a potential token to attend to |
+
+            The attention formula is: **"For each query, compute attention weights over all keys"**
+            ```
+            Row i, Column j = "Can token at position i attend to token at position j?"
+                            = 0 if j ≤ i (past or current = allowed)
+                            = 1 if j > i (future = blocked)
+            """
 
         # Use the mask to fill attention scores
         attn_scores.masked_fill_(mask_bool, -torch.inf)
@@ -210,6 +286,13 @@ class GPTModel(nn.Module):
         self.out_head = nn.Linear(cfg["emb_dim"], cfg["vocab_size"], bias=False)
 
     def forward(self, in_idx, use_cache=False):
+        # in_idx is token ids
+        # Example: batch of 2 sequences, each with 5 tokens
+        # in_idx = torch.tensor([
+        #     [101, 2054, 2003, 1996, 3376],   # "What is the weather"
+        #     [1045, 2293, 3013, 2833, 1012]   # "I love deep learning."
+        # ])
+
         batch_size, seq_len = in_idx.shape
         tok_embeds = self.tok_emb(in_idx)
 
@@ -320,8 +403,16 @@ def main():
     model = GPTModel(GPT_CONFIG_124M)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
-    model.eval()  # disable dropout
-
+    model.eval()  # disable dropout 
+    """
+    Liwen: model.eval() sets an internal flag self.training = False, 
+    and nn.Dropout checks this flag to decide whether to drop neurons or not.
+    model.eval() simply does:
+        model.training = False
+        # AND for all submodules (layers):
+        model.drop_emb.training = False
+        model.trf_blocks[0].att.dropout.training = False
+    """
     start_context = "Hello, I am"
 
     tokenizer = tiktoken.get_encoding("gpt2")
